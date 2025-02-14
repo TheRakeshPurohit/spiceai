@@ -1,0 +1,136 @@
+---
+name: integration tests (llms)
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    paths:
+      - "crates/llms/**"
+
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'Which groups of models to run'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - hosted
+          - self-hosted
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: spiceai-runners
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: 'self-hosted',
+                needs_env: false,
+                runner: 'macOS',
+                model_allowlist: 'local_phi3,hf_phi3'
+              },
+              {
+                name: 'hosted',
+                needs_env: true,
+                runner: 'macOS',
+                model_allowlist: 'anthropic,openai,xai,perplexity'
+              }
+            ];
+
+            if (context.eventName === 'workflow_dispatch') {
+              const name = context.payload.inputs.run;
+
+              if (name === 'all') {
+                return matrix;
+              }
+
+              return matrix.filter(m => m.name === name);
+            }
+            return matrix;
+
+  build:
+    name: Build Test Binary
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: darwin
+
+      - name: Build LLMs integration test binary
+        run: |
+          TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          cp $TEST_BINARY_PATH ./llms_integration_test
+
+      - name: Upload test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: llms-integration-test-binary
+          path: ./llms_integration_test
+          retention-days: 1
+
+  test:
+    runs-on: [self-hosted, macOS]
+    needs: [build, setup-matrix]
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    permissions: read-all
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: llms-integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        run: chmod +x ./integration_test/llms_integration_test
+
+      - name: Run integration test
+        env:
+          MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
+        run: |
+          if [ "${{ matrix.target.needs_env }}" == "true" ]; then
+            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
+              echo "Error: OpenAI API key is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
+              echo "Error: Anthropic API key is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_XAI_API_KEY" ]; then
+              echo "Error: xAI API key is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
+              echo "Error: Perplexity API key is not defined."
+              exit 1
+            fi
+          fi
+          # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- llms::tests --test-threads=2
